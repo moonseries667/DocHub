@@ -1,0 +1,19 @@
+bin/
+# A bare `go build` in the repo root drops the server binary here; the Makefile
+# writes into bin/ instead, and neither should be committed.
+/server
+/server.exe
+configs/config.yaml
+*.log
+.tmp/
+data/
+
+# Go caches fixed by the Makefile; never commit them.
+.gocache/
+.gomodcache/
+.gopath/
+
+# Local dependency downloads and tool caches.
+.tools/
+.probe/
+.uvcache/
