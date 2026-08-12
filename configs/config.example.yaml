@@ -1,0 +1,46 @@
+server:
+  addr: ":8080"
+
+mysql:
+  dsn: "root:rootpass@tcp(127.0.0.1:3306)/docnub?parseTime=true&charset=utf8mb4&loc=Local"
+  max_open_conns: 16
+  max_idle_conns: 4
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+auth:
+  # Local development only. Override with GODOC_JWT_SECRET anywhere else.
+  jwt_secret: "dev-only-change-me"
+  token_ttl: 2h
+
+storage:
+  # cloud (default) — the S3-compatible bucket below. This is the deployment path.
+  # dev             — a local directory under local_root. It exists so a checkout
+  #                   runs without a bucket; the server logs a warning when chosen.
+  mode: "cloud"
+  local_root: "data/files"
+  # Credentials come from GODOC_S3_ACCESS_KEY / GODOC_S3_SECRET_KEY so this file
+  # never carries a secret.
+  #
+  # Any S3-compatible endpoint works. For Cloudflare R2 the endpoint is
+  # <account-id>.r2.cloudflarestorage.com with use_ssl on and region "auto";
+  # for a self-hosted gateway use host:port with use_ssl off.
+  s3:
+    endpoint: "127.0.0.1:9000"
+    bucket: "godochub"
+    use_ssl: false
+    region: ""
+
+chunk:
+  temp_root: "data/chunks"
+  pool_size: 4
+  idle_hours: 24
+  reclaim_every: 10m
+
+rate_limit:
+  enabled: true
+  burst: 100
+  window: 1m
