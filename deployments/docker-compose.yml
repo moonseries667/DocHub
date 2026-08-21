@@ -1,0 +1,36 @@
+# MySQL and Redis. The object store is not here: files live in a cloud bucket
+# (Cloudflare R2 in this setup), configured by storage.s3 in configs/config.yaml
+# plus the GODOC_S3_* environment variables.
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: godochub-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: docnub
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpass"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: godochub-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mysql-data:
