@@ -120,6 +120,7 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	protected.GET("/users", tenantHandler.ListUsers)
 	protected.POST("/users", perm.RequireManage(permStore), tenantHandler.CreateUser)
 	protected.GET("/roles", tenantHandler.ListRoles)
+	protected.POST("/roles", perm.RequireManage(permStore), tenantHandler.CreateRole)
 	protected.PUT("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.AssignRole)
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	// Usage answers "how much room is left", which is what makes a quota visible.

@@ -5,15 +5,19 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var (
-	ErrUsernameTaken = errors.New("tenant: username already used in this tenant")
-	ErrRoleNotFound  = errors.New("tenant: role not found in this tenant")
-	ErrQuotaExceeded = errors.New("tenant: storage quota exceeded")
+	ErrUsernameTaken     = errors.New("tenant: username already used in this tenant")
+	ErrRoleNotFound      = errors.New("tenant: role not found in this tenant")
+	ErrRoleCodeTaken     = errors.New("tenant: role code already used in this tenant")
+	ErrUnknownPermission = errors.New("tenant: unknown permission code")
+	ErrInvalidRole       = errors.New("tenant: invalid role definition")
+	ErrQuotaExceeded     = errors.New("tenant: storage quota exceeded")
 )
 
 // User is one account in a tenant. The password hash never leaves this package:
@@ -135,22 +139,155 @@ func (s *Store) RevokeRole(ctx context.Context, tenantID, userID, roleID int64) 
 	return n > 0, nil
 }
 
-// RolesOfTenant lists the roles defined by one tenant, so a client can pick a
-// role id without reading the database.
+// RolesOfTenant lists the roles defined by one tenant together with the
+// permission codes each one grants, so a client can pick a role id without
+// reading the database — and can tell two roles apart without guessing from
+// their names.
 func (s *Store) RolesOfTenant(ctx context.Context, tenantID int64) ([]Role, error) {
-	out := []Role{}
-	if err := s.db.SelectContext(ctx, &out,
-		"SELECT id, code, name FROM role WHERE tenant_id = ? ORDER BY id", tenantID); err != nil {
+	var rows []roleRow
+	if err := s.db.SelectContext(ctx, &rows, `
+		SELECT r.id, r.code, r.name,
+		       COALESCE(GROUP_CONCAT(rp.permission ORDER BY rp.permission SEPARATOR ','), '') AS perms
+		FROM role r
+		LEFT JOIN role_permission rp ON rp.role_id = r.id AND rp.tenant_id = r.tenant_id
+		WHERE r.tenant_id = ?
+		GROUP BY r.id, r.code, r.name
+		ORDER BY r.id`, tenantID); err != nil {
 		return nil, fmt.Errorf("list roles: %w", err)
+	}
+	out := make([]Role, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, Role{ID: r.ID, Code: r.Code, Name: r.Name, Permissions: splitPerms(r.Perms)})
+	}
+	return out, nil
+}
+
+// roleRow is the scan shape for the aggregate query above; Role itself carries a
+// slice, which GROUP_CONCAT cannot produce directly.
+type roleRow struct {
+	ID    int64  `db:"id"`
+	Code  string `db:"code"`
+	Name  string `db:"name"`
+	Perms string `db:"perms"`
+}
+
+// splitPerms turns "a,b,c" into a slice, and an empty string into an empty slice
+// rather than [""].
+func splitPerms(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// CreateRole adds a role to the tenant and grants it the given permission codes.
+//
+// The two inserts are one transaction on purpose: a role with no permissions
+// grants nothing, and leaving one behind after a failed request would show up as
+// a selectable role that silently denies everything.
+//
+// Permission codes are validated against the permission table before anything is
+// written, so an unknown code is a 400 that names the code rather than a foreign
+// key violation surfacing as a 500.
+func (s *Store) CreateRole(ctx context.Context, tenantID int64, code, name string, permissions []string) (*Role, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil, fmt.Errorf("%w: role code is empty", ErrInvalidRole)
+	}
+	if len(permissions) == 0 {
+		return nil, fmt.Errorf("%w: a role with no permissions grants nothing", ErrInvalidRole)
+	}
+	if name == "" {
+		name = code
+	}
+
+	perms, err := s.knownPermissions(ctx, permissions)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin role transaction: %w", err)
+	}
+	// Rollback is a no-op once Commit has succeeded, so a bare defer is safe and
+	// keeps every early return from having to remember it.
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		"INSERT INTO role (tenant_id, code, name) VALUES (?, ?, ?)", tenantID, code, name)
+	if err != nil {
+		if isDuplicate(err) {
+			return nil, ErrRoleCodeTaken
+		}
+		return nil, fmt.Errorf("create role %q: %w", code, err)
+	}
+	roleID, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("role id of %q: %w", code, err)
+	}
+
+	for _, p := range perms {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO role_permission (tenant_id, role_id, permission) VALUES (?, ?, ?)",
+			tenantID, roleID, p); err != nil {
+			return nil, fmt.Errorf("grant %q to role %q: %w", p, code, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit role %q: %w", code, err)
+	}
+	return &Role{ID: roleID, Code: code, Name: name, Permissions: perms}, nil
+}
+
+// knownPermissions filters the request down to distinct codes that exist in the
+// permission table, and reports the first unknown one.
+func (s *Store) knownPermissions(ctx context.Context, want []string) ([]string, error) {
+	var catalog []string
+	if err := s.db.SelectContext(ctx, &catalog, "SELECT code FROM permission"); err != nil {
+		return nil, fmt.Errorf("load permission codes: %w", err)
+	}
+	known := make(map[string]bool, len(catalog))
+	for _, c := range catalog {
+		known[c] = true
+	}
+
+	seen := make(map[string]bool, len(want))
+	out := make([]string, 0, len(want))
+	for _, p := range want {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !known[p] {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownPermission, p)
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: no valid permission code given", ErrInvalidRole)
 	}
 	return out, nil
 }
 
 // Role is one role row as the API exposes it.
 type Role struct {
-	ID   int64  `db:"id" json:"id"`
-	Code string `db:"code" json:"code"`
-	Name string `db:"name" json:"name"`
+	ID          int64    `db:"id" json:"id"`
+	Code        string   `db:"code" json:"code"`
+	Name        string   `db:"name" json:"name"`
+	Permissions []string `db:"-" json:"permissions"`
 }
 
 // checkUser confirms the user belongs to tenantID before any write touches it.

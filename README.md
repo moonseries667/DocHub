@@ -53,7 +53,8 @@ OK: byte identical
 
 > 能开户、能授权、知道还剩多少地方放文件。
 
-- `POST /users` 建账号（密码在服务端 bcrypt，任何响应都不回显哈希）；`GET /users`、`GET /roles` 分页列出本租户的账号与角色。
+- `POST /roles` 定义角色并一次带上它授予的权限码——角色与权限在同一个事务里，不会留下一个选得到却什么都不给的壳；权限码先对照 `permission` 表校验，拼错返回 400 并点名是哪个码，而不是把外键冲突变成 500。`GET /roles` 连权限码一起列出。
+- `POST /users` 建账号（密码在服务端 bcrypt，任何响应都不回显哈希）；`GET /users` 分页列出本租户的账号。
 - `PUT /users/:id/roles/:role_id` 与 `DELETE` 授予/撤销角色，两侧都校验属于同一租户——跨租户的角色 id 会 404，不会把别家的权限搬过来。
 - 建账号与授权都要求 `perm.manage`：能登录不等于能开户。
 - `GET /usage` 报出 `file_count` / `used_bytes` / `quota_bytes` / `remaining` / `used_percent`；配额按 `SUM(size)` 现算，不维护会漂移的计数字段。超配额的上传与分片 init 都在写字节之前返回 413。

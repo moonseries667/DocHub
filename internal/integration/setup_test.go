@@ -233,6 +233,7 @@ func newTestEnvFull(t *testing.T, burst int, window time.Duration) *testEnv {
 	protected.GET("/users", tenantHandler.ListUsers)
 	protected.POST("/users", perm.RequireManage(permStore), tenantHandler.CreateUser)
 	protected.GET("/roles", tenantHandler.ListRoles)
+	protected.POST("/roles", perm.RequireManage(permStore), tenantHandler.CreateRole)
 	protected.PUT("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.AssignRole)
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	protected.GET("/usage", tenantHandler.Usage)

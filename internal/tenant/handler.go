@@ -183,6 +183,36 @@ func (h *Handler) RevokeRole(c *gin.Context) {
 
 // ListRoles reports the roles the caller's tenant defines, so a client can pick
 // a role id without reading the database.
+// CreateRole defines a role and the permission codes it grants.
+//
+// Both halves arrive in one request because a role without permissions is not a
+// usable object: it would show up in the list, be assignable, and silently deny
+// everything. Requiring perm.manage keeps role definition with the other
+// privileged acts — defining a role is deciding what people may do.
+func (h *Handler) CreateRole(c *gin.Context) {
+	ident, ok := FromContext(c.Request.Context())
+	if !ok {
+		_ = c.Error(httpx.ErrUnauthorized)
+		return
+	}
+	var body struct {
+		Code        string   `json:"code"`
+		Name        string   `json:"name"`
+		Permissions []string `json:"permissions"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		_ = c.Error(httpx.ErrInvalidRequest)
+		return
+	}
+
+	role, err := h.store.CreateRole(c.Request.Context(), ident.TenantID, body.Code, body.Name, body.Permissions)
+	if err != nil {
+		_ = c.Error(mapAdminError(err))
+		return
+	}
+	httpx.OK(c, role)
+}
+
 func (h *Handler) ListRoles(c *gin.Context) {
 	ident, ok := FromContext(c.Request.Context())
 	if !ok {
@@ -276,6 +306,14 @@ func mapAdminError(err error) error {
 		return httpx.ErrNotFound
 	case errors.Is(err, ErrRoleNotFound):
 		return httpx.NewError(http.StatusNotFound, "role not found in this tenant")
+	case errors.Is(err, ErrRoleCodeTaken):
+		return httpx.NewError(http.StatusConflict, "this role code is already used in the tenant")
+	case errors.Is(err, ErrUnknownPermission):
+		// The message names the offending code: a client sending a typo should
+		// learn which one, not just "invalid request".
+		return httpx.NewError(http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrInvalidRole):
+		return httpx.NewError(http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrQuotaExceeded):
 		return httpx.NewError(http.StatusRequestEntityTooLarge, "storage quota exceeded")
 	case errors.Is(err, ErrUsernameTaken):
