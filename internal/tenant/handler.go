@@ -213,6 +213,59 @@ func (h *Handler) CreateRole(c *gin.Context) {
 	httpx.OK(c, role)
 }
 
+// UpdateRolePermissions replaces what a role grants.
+//
+// The body is the full set, not a delta: a client that resends after a timeout
+// gets the same result, and there is no way to leave behind a code the caller
+// thought it had removed.
+func (h *Handler) UpdateRolePermissions(c *gin.Context) {
+	ident, ok := FromContext(c.Request.Context())
+	if !ok {
+		_ = c.Error(httpx.ErrUnauthorized)
+		return
+	}
+	roleID, err := parsePathID(c.Param("id"))
+	if err != nil {
+		_ = c.Error(httpx.ErrInvalidRequest)
+		return
+	}
+	var body struct {
+		Permissions []string `json:"permissions"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		_ = c.Error(httpx.ErrInvalidRequest)
+		return
+	}
+
+	role, err := h.store.UpdateRolePermissions(c.Request.Context(), ident.TenantID, roleID, body.Permissions)
+	if err != nil {
+		_ = c.Error(mapAdminError(err))
+		return
+	}
+	httpx.OK(c, role)
+}
+
+// DeleteRole removes a role nobody holds. A role still assigned to users is a
+// 409 with the count, so the caller can revoke deliberately instead of deleting
+// six grants by accident.
+func (h *Handler) DeleteRole(c *gin.Context) {
+	ident, ok := FromContext(c.Request.Context())
+	if !ok {
+		_ = c.Error(httpx.ErrUnauthorized)
+		return
+	}
+	roleID, err := parsePathID(c.Param("id"))
+	if err != nil {
+		_ = c.Error(httpx.ErrInvalidRequest)
+		return
+	}
+	if err := h.store.DeleteRole(c.Request.Context(), ident.TenantID, roleID); err != nil {
+		_ = c.Error(mapAdminError(err))
+		return
+	}
+	httpx.OK(c, gin.H{"deleted": roleID})
+}
+
 func (h *Handler) ListRoles(c *gin.Context) {
 	ident, ok := FromContext(c.Request.Context())
 	if !ok {
@@ -306,6 +359,8 @@ func mapAdminError(err error) error {
 		return httpx.ErrNotFound
 	case errors.Is(err, ErrRoleNotFound):
 		return httpx.NewError(http.StatusNotFound, "role not found in this tenant")
+	case errors.Is(err, ErrRoleInUse):
+		return httpx.NewError(http.StatusConflict, err.Error())
 	case errors.Is(err, ErrRoleCodeTaken):
 		return httpx.NewError(http.StatusConflict, "this role code is already used in the tenant")
 	case errors.Is(err, ErrUnknownPermission):

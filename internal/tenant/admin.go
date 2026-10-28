@@ -15,6 +15,7 @@ var (
 	ErrUsernameTaken     = errors.New("tenant: username already used in this tenant")
 	ErrRoleNotFound      = errors.New("tenant: role not found in this tenant")
 	ErrRoleCodeTaken     = errors.New("tenant: role code already used in this tenant")
+	ErrRoleInUse         = errors.New("tenant: role is still assigned to users")
 	ErrUnknownPermission = errors.New("tenant: unknown permission code")
 	ErrInvalidRole       = errors.New("tenant: invalid role definition")
 	ErrQuotaExceeded     = errors.New("tenant: storage quota exceeded")
@@ -118,7 +119,10 @@ func (s *Store) AssignRole(ctx context.Context, tenantID, userID, roleID int64) 
 		"INSERT IGNORE INTO user_role (user_id, role_id) VALUES (?, ?)", userID, roleID); err != nil {
 		return fmt.Errorf("assign role %d to user %d: %w", roleID, userID, err)
 	}
-	return nil
+	// The grant changes what this user may do, so every decision cached for them
+	// before it is now wrong. Skipping this makes a new role look inert for up to
+	// the cache TTL — the slow-revoke trap the ACL write path already avoids.
+	return s.userPermissionsChanged(ctx, tenantID, userID)
 }
 
 // RevokeRole removes one grant. A grant that is not there is not an error: the
@@ -135,6 +139,12 @@ func (s *Store) RevokeRole(ctx context.Context, tenantID, userID, roleID int64) 
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("count revoked grants: %w", err)
+	}
+	// Revoking narrows what the user may do, so the cached answers must go too:
+	// a revocation that only takes effect after the TTL is a revocation nobody
+	// can rely on.
+	if err := s.userPermissionsChanged(ctx, tenantID, userID); err != nil {
+		return n > 0, err
 	}
 	return n > 0, nil
 }
@@ -246,6 +256,122 @@ func (s *Store) CreateRole(ctx context.Context, tenantID int64, code, name strin
 		return nil, fmt.Errorf("commit role %q: %w", code, err)
 	}
 	return &Role{ID: roleID, Code: code, Name: name, Permissions: perms}, nil
+}
+
+// OnUserPermissionsChanged registers what to run after a user's grants change.
+func (s *Store) OnUserPermissionsChanged(fn func(ctx context.Context, tenantID, userID int64) error) {
+	s.onUserPermissionsChanged = fn
+}
+
+// OnRolePermissionsChanged registers what to run after a role's permission codes
+// change. The callback is what drops the cached decisions of everyone holding it.
+func (s *Store) OnRolePermissionsChanged(fn func(ctx context.Context, tenantID, roleID int64) error) {
+	s.onRolePermissionsChanged = fn
+}
+
+func (s *Store) userPermissionsChanged(ctx context.Context, tenantID, userID int64) error {
+	if s.onUserPermissionsChanged == nil {
+		return nil
+	}
+	return s.onUserPermissionsChanged(ctx, tenantID, userID)
+}
+
+func (s *Store) rolePermissionsChanged(ctx context.Context, tenantID, roleID int64) error {
+	if s.onRolePermissionsChanged == nil {
+		return nil
+	}
+	return s.onRolePermissionsChanged(ctx, tenantID, roleID)
+}
+
+// UpdateRolePermissions replaces a role's permission set.
+//
+// Replace rather than add/remove: the caller states what the role grants, which
+// makes a retry idempotent and leaves no way to accumulate a code nobody meant to
+// keep. The delete and the inserts share one transaction so a failure cannot
+// leave the role granting a half-set.
+//
+// It also invalidates the cached decisions of every user holding the role. Without
+// that, tightening a role would appear to do nothing for up to the cache TTL —
+// the slow-revoke problem the ACL write path was already designed around.
+func (s *Store) UpdateRolePermissions(ctx context.Context, tenantID, roleID int64, permissions []string) (*Role, error) {
+	if len(permissions) == 0 {
+		return nil, fmt.Errorf("%w: a role with no permissions grants nothing", ErrInvalidRole)
+	}
+	role, err := s.roleInTenant(ctx, tenantID, roleID)
+	if err != nil {
+		return nil, err
+	}
+	perms, err := s.knownPermissions(ctx, permissions)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin role update transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM role_permission WHERE role_id = ? AND tenant_id = ?", roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("clear permissions of role %d: %w", roleID, err)
+	}
+	for _, p := range perms {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO role_permission (tenant_id, role_id, permission) VALUES (?, ?, ?)",
+			tenantID, roleID, p); err != nil {
+			return nil, fmt.Errorf("grant %q to role %d: %w", p, roleID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit role %d: %w", roleID, err)
+	}
+
+	role.Permissions = perms
+	if err := s.rolePermissionsChanged(ctx, tenantID, roleID); err != nil {
+		return nil, err
+	}
+	return role, nil
+}
+
+// DeleteRole removes a role that nobody holds.
+//
+// A role that is still assigned is refused rather than deleted with its grants
+// cascading away: "delete this role" and "revoke it from six people" are different
+// intents, and the second one has no undo. The FK would happily cascade, which is
+// exactly why the check lives here — the database cannot tell the two apart.
+func (s *Store) DeleteRole(ctx context.Context, tenantID, roleID int64) error {
+	if _, err := s.roleInTenant(ctx, tenantID, roleID); err != nil {
+		return err
+	}
+	var holders int
+	if err := s.db.GetContext(ctx, &holders,
+		"SELECT COUNT(*) FROM user_role WHERE role_id = ?", roleID); err != nil {
+		return fmt.Errorf("count holders of role %d: %w", roleID, err)
+	}
+	if holders > 0 {
+		return fmt.Errorf("%w: %d user(s) still hold it", ErrRoleInUse, holders)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		"DELETE FROM role WHERE id = ? AND tenant_id = ?", roleID, tenantID); err != nil {
+		return fmt.Errorf("delete role %d: %w", roleID, err)
+	}
+	return s.rolePermissionsChanged(ctx, tenantID, roleID)
+}
+
+// roleInTenant loads one role, scoped by tenant so a foreign id is a 404 rather
+// than a cross-tenant edit.
+func (s *Store) roleInTenant(ctx context.Context, tenantID, roleID int64) (*Role, error) {
+	var r Role
+	err := s.db.GetContext(ctx, &r,
+		"SELECT id, code, name FROM role WHERE id = ? AND tenant_id = ? LIMIT 1", roleID, tenantID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrRoleNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load role %d: %w", roleID, err)
+	}
+	return &r, nil
 }
 
 // knownPermissions filters the request down to distinct codes that exist in the

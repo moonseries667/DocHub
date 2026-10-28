@@ -19,6 +19,18 @@ var ErrNotFound = errors.New("tenant: not found")
 // signature makes the scope impossible to overlook.
 type Store struct {
 	db *sqlx.DB
+	// Permission decisions are cached per (user, path, action) by the permission
+	// package. Granting a role, revoking one, or rewriting a role's permission
+	// codes all make those cached answers wrong, and this package cannot reach
+	// that cache: it would have to import perm, and perm already imports nothing
+	// from here but the cycle would close the moment it did.
+	//
+	// Two hooks rather than one with a subject-kind string: the caller wires each
+	// to the matching invalidation, and neither side has to agree on magic values.
+	// A nil hook means "nothing to invalidate", which is what a test that does not
+	// exercise caching wants.
+	onUserPermissionsChanged func(ctx context.Context, tenantID, userID int64) error
+	onRolePermissionsChanged func(ctx context.Context, tenantID, roleID int64) error
 }
 
 func NewStore(db *sqlx.DB) *Store {

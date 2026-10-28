@@ -99,6 +99,16 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	fileHandler := file.NewHandler(fileService)
 	chunkHandler := chunk.NewHandler(chunkService)
 	permStore := perm.NewStore(db, rdb)
+	// Granting a role, revoking one, or rewriting a role's permission codes all
+	// invalidate the decisions cached for the affected subject. The tenant package
+	// owns those writes and cannot reach the permission cache, so the two hooks are
+	// wired here — same shape as the quota hook above.
+	tenantStore.OnUserPermissionsChanged(func(ctx context.Context, tenantID, userID int64) error {
+		return permStore.InvalidateSubject(ctx, tenantID, perm.SubjectUser, userID)
+	})
+	tenantStore.OnRolePermissionsChanged(func(ctx context.Context, tenantID, roleID int64) error {
+		return permStore.InvalidateSubject(ctx, tenantID, perm.SubjectRole, roleID)
+	})
 	permHandler := perm.NewHandler(permStore)
 	engine.POST("/api/v1/login", authHandler.Login)
 
@@ -121,6 +131,8 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	protected.POST("/users", perm.RequireManage(permStore), tenantHandler.CreateUser)
 	protected.GET("/roles", tenantHandler.ListRoles)
 	protected.POST("/roles", perm.RequireManage(permStore), tenantHandler.CreateRole)
+	protected.PUT("/roles/:id/permissions", perm.RequireManage(permStore), tenantHandler.UpdateRolePermissions)
+	protected.DELETE("/roles/:id", perm.RequireManage(permStore), tenantHandler.DeleteRole)
 	protected.PUT("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.AssignRole)
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	// Usage answers "how much room is left", which is what makes a quota visible.

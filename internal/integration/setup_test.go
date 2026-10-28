@@ -172,7 +172,14 @@ func newTestEnvFull(t *testing.T, burst int, window time.Duration) *testEnv {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr()})
 	t.Cleanup(func() { rdb.Close() })
 	permStore := perm.NewStore(db, rdb)
-
+	// Mirrors main.go: without this the suite would never notice that a role change
+	// left a stale decision behind.
+	tenantStore.OnUserPermissionsChanged(func(ctx context.Context, tenantID, userID int64) error {
+		return permStore.InvalidateSubject(ctx, tenantID, perm.SubjectUser, userID)
+	})
+	tenantStore.OnRolePermissionsChanged(func(ctx context.Context, tenantID, roleID int64) error {
+		return permStore.InvalidateSubject(ctx, tenantID, perm.SubjectRole, roleID)
+	})
 	// Permission decisions are cached in Redis and keyed by user and path, so a
 	// previous run's keys must not answer for this one.
 	clearPermCache(t, rdb)
@@ -234,6 +241,8 @@ func newTestEnvFull(t *testing.T, burst int, window time.Duration) *testEnv {
 	protected.POST("/users", perm.RequireManage(permStore), tenantHandler.CreateUser)
 	protected.GET("/roles", tenantHandler.ListRoles)
 	protected.POST("/roles", perm.RequireManage(permStore), tenantHandler.CreateRole)
+	protected.PUT("/roles/:id/permissions", perm.RequireManage(permStore), tenantHandler.UpdateRolePermissions)
+	protected.DELETE("/roles/:id", perm.RequireManage(permStore), tenantHandler.DeleteRole)
 	protected.PUT("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.AssignRole)
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	protected.GET("/usage", tenantHandler.Usage)
