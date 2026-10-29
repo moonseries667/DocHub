@@ -1,5 +1,6 @@
 # Go-DocHub
 
+[![CI](https://github.com/moonseries667/DocHub/actions/workflows/ci.yml/badge.svg)](https://github.com/moonseries667/DocHub/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go)
 ![Gin](https://img.shields.io/badge/Gin-1.10-008ECF?style=flat-square)
 ![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?style=flat-square&logo=mysql)
@@ -60,6 +61,15 @@ OK: byte identical
 - `PUT /users/:id/roles/:role_id` 与 `DELETE` 授予/撤销角色，两侧都校验属于同一租户——跨租户的角色 id 会 404，不会把别家的权限搬过来。
 - 建账号与授权都要求 `perm.manage`：能登录不等于能开户。
 - `GET /usage` 报出 `file_count` / `used_bytes` / `quota_bytes` / `remaining` / `used_percent`；配额按 `SUM(size)` 现算，不维护会漂移的计数字段。超配额的上传与分片 init 都在写字节之前返回 413。
+- `GET /audit` 是权限变更的审计轨迹：谁、什么时候、对哪个主体、把哪个路径的什么位改成了什么。`acl_entry` 和 `role_permission` 只有当前状态，回答不了「这条权限是谁加的」——事后的撤销争议和事故复盘都从这里查。写审计失败只记日志不失败请求，因为变更已经生效，告诉调用方失败会引它重试一次已发生的操作。
+
+### 可诊断性
+
+> 线上出问题时，日志要能串成一个请求，而不是散成一堆。
+
+- 每个请求带一个相关 ID：调用方传 `X-Request-Id` 就沿用（便于跨服务串联），没传就生成 16 位十六进制，并回写到响应头。值只允许字母数字与 `-_.:`，超长或含换行的直接换新——头字段是攻击者可控的，不过滤就能用来切分结构化日志。
+- 5xx 的日志行带 `request_id`、method、path 和原始错误；4xx 刻意不记，因为那是客户端的问题，记下来只是噪音。
+- panic 有 recovery 中间件，记 `request_id` 与完整堆栈后返回统一的 500，不会把 goroutine 栈漏给调用方。
 
 ## 系统流程
 

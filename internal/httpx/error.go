@@ -46,6 +46,7 @@ func Fail(c *gin.Context, err error) {
 	}
 	if apiErr.Status >= http.StatusInternalServerError {
 		slog.Error("request failed",
+			"request_id", RequestID(c.Request.Context()),
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"err", err)

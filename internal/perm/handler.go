@@ -2,10 +2,13 @@ package perm
 
 import (
 	"errors"
+	"fmt"
+	"log/slog"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 
+	"godochub/internal/audit"
 	"godochub/internal/file"
 	"godochub/internal/httpx"
 	"godochub/internal/tenant"
@@ -14,10 +17,35 @@ import (
 // Handler exposes the permission checks the API needs.
 type Handler struct {
 	store *Store
+	// audit may be nil: the read-only endpoints do not need it, and a test that
+	// only exercises checks should not have to build one.
+	audit *audit.Store
 }
 
-func NewHandler(store *Store) *Handler {
-	return &Handler{store: store}
+func NewHandler(store *Store, trail *audit.Store) *Handler {
+	return &Handler{store: store, audit: trail}
+}
+
+// record appends one audit row and logs a failure instead of returning it.
+//
+// The permission change has already been applied by the time this runs, so
+// failing the request would tell the caller their change did not happen when it
+// did — and they would retry it. A gap in the trail is the lesser evil, and the
+// log line is what makes the gap visible.
+func (h *Handler) record(c *gin.Context, e audit.Entry) {
+	if h.audit == nil {
+		return
+	}
+	ident, ok := tenant.FromContext(c.Request.Context())
+	if ok {
+		e.TenantID = ident.TenantID
+		e.ActorUserID = ident.UserID
+		e.ActorUsername = ident.Username
+	}
+	if err := h.audit.Record(c.Request.Context(), e); err != nil {
+		slog.Error("write audit row failed",
+			"request_id", httpx.RequestID(c.Request.Context()), "err", err)
+	}
 }
 
 // Guard rejects a request when the caller's roles and ACL do not allow action on
@@ -183,6 +211,14 @@ func (h *Handler) SetACL(c *gin.Context) {
 		_ = c.Error(err)
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionACLSet,
+		SubjectKind: body.SubjectKind,
+		SubjectID:   body.SubjectID,
+		Path:        path,
+		AllowMask:   allow,
+		DenyMask:    deny,
+	})
 	httpx.OK(c, gin.H{
 		"tenant_id":    ident.TenantID,
 		"subject_kind": body.SubjectKind,
@@ -225,6 +261,15 @@ func (h *Handler) DeleteACL(c *gin.Context) {
 		_ = c.Error(err)
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionACLDelete,
+		SubjectKind: subjectKind,
+		SubjectID:   subjectID,
+		Path:        NormalizePath(c.Query("path")),
+		// Whether a row actually went away is the difference between a revoke and
+		// a no-op, and the trail has to keep that distinction.
+		Detail: fmt.Sprintf("removed=%t", removed),
+	})
 	httpx.OK(c, gin.H{"removed": removed, "path": NormalizePath(c.Query("path"))})
 }
 

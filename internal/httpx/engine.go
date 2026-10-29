@@ -12,7 +12,10 @@ import (
 // Routes are registered by the caller; this only guarantees the response shape.
 func NewEngine(logger *slog.Logger) *gin.Engine {
 	engine := gin.New()
-	engine.Use(recovery(logger), errorHandler())
+	// requestID runs first: both loggers below attach the id to their lines, and
+	// an id assigned after them would be missing from the record of exactly the
+	// failures it is meant to identify.
+	engine.Use(requestID(), recovery(logger), errorHandler())
 
 	engine.NoRoute(func(c *gin.Context) {
 		_ = c.Error(ErrNotFound)
@@ -32,7 +35,12 @@ func errorHandler() gin.HandlerFunc {
 
 func recovery(logger *slog.Logger) gin.HandlerFunc {
 	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, err any) {
-		logger.Error("panic recovered", "err", err, "stack", string(debug.Stack()))
+		logger.Error("panic recovered",
+			"request_id", RequestID(c.Request.Context()),
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"err", err,
+			"stack", string(debug.Stack()))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, Response{
 			Code:    http.StatusInternalServerError,
 			Message: ErrInternal.Message,

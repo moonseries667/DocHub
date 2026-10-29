@@ -30,6 +30,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 
+	"godochub/internal/audit"
 	"godochub/internal/auth"
 	"godochub/internal/chunk"
 	"godochub/internal/file"
@@ -195,10 +196,11 @@ func newTestEnvFull(t *testing.T, burst int, window time.Duration) *testEnv {
 		protected.Use(ratelimit.Middleware(limiter, testLogger()))
 	}
 
-	tenantHandler := tenant.NewHandler(tenantStore)
+	auditStore := audit.NewStore(db)
+	tenantHandler := tenant.NewHandler(tenantStore, auditStore)
 	fileHandler := file.NewHandler(fileService)
 	chunkHandler := chunk.NewHandler(chunkService)
-	permHandler := perm.NewHandler(permStore)
+	permHandler := perm.NewHandler(permStore, auditStore)
 	// The route table mirrors main.go, guards included. Registering a route here
 	// without the guard main puts on it is how the init/body bug survived a green
 	// suite: the resolver never ran in any test.
@@ -246,6 +248,9 @@ func newTestEnvFull(t *testing.T, burst int, window time.Duration) *testEnv {
 	protected.PUT("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.AssignRole)
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	protected.GET("/usage", tenantHandler.Usage)
+	// The permission trail: who changed what, and when. Reading it names paths and
+	// users, so it needs the same capability as changing them.
+	protected.GET("/audit", perm.RequireManage(permStore), tenantHandler.ListAudit)
 	protected.GET("/permissions", permHandler.MyPermissions)
 	protected.GET("/permissions/check", permHandler.Check)
 	protected.PUT("/permissions/acl", permHandler.SetACL)

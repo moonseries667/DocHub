@@ -18,6 +18,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 
+	"godochub/internal/audit"
 	"godochub/internal/auth"
 	"godochub/internal/chunk"
 	"godochub/internal/config"
@@ -95,7 +96,8 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	engine.GET("/healthz", healthz(db, rdb))
 
 	authHandler := auth.NewHandler(authService)
-	tenantHandler := tenant.NewHandler(tenantStore)
+	auditStore := audit.NewStore(db)
+	tenantHandler := tenant.NewHandler(tenantStore, auditStore)
 	fileHandler := file.NewHandler(fileService)
 	chunkHandler := chunk.NewHandler(chunkService)
 	permStore := perm.NewStore(db, rdb)
@@ -109,7 +111,7 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	tenantStore.OnRolePermissionsChanged(func(ctx context.Context, tenantID, roleID int64) error {
 		return permStore.InvalidateSubject(ctx, tenantID, perm.SubjectRole, roleID)
 	})
-	permHandler := perm.NewHandler(permStore)
+	permHandler := perm.NewHandler(permStore, auditStore)
 	engine.POST("/api/v1/login", authHandler.Login)
 
 	protected := engine.Group("/api/v1", auth.Middleware(authService))
@@ -137,6 +139,9 @@ func run(configPath, migrationsDir string, logger *slog.Logger) error {
 	protected.DELETE("/users/:id/roles/:role_id", perm.RequireManage(permStore), tenantHandler.RevokeRole)
 	// Usage answers "how much room is left", which is what makes a quota visible.
 	protected.GET("/usage", tenantHandler.Usage)
+	// The permission trail: who changed what, and when. Reading it names paths and
+	// users, so it needs the same capability as changing them.
+	protected.GET("/audit", perm.RequireManage(permStore), tenantHandler.ListAudit)
 	protected.GET("/permissions", permHandler.MyPermissions)
 	protected.GET("/permissions/check", permHandler.Check)
 	// Writing the ACL is what makes a revocation take effect: the handler writes

@@ -2,21 +2,79 @@ package tenant
 
 import (
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
+	"godochub/internal/audit"
 	"godochub/internal/httpx"
 )
 
 type Handler struct {
 	store *Store
+	// audit may be nil; the read-only endpoints do not need it.
+	audit *audit.Store
 }
 
-func NewHandler(store *Store) *Handler {
-	return &Handler{store: store}
+func NewHandler(store *Store, trail *audit.Store) *Handler {
+	return &Handler{store: store, audit: trail}
+}
+
+// record appends one audit row for a permission mutation.
+//
+// A failure is logged, not returned: the change is already committed, so failing
+// the response would invite a retry of something that already happened. See the
+// note on audit.Store.Record.
+func (h *Handler) record(c *gin.Context, e audit.Entry) {
+	if h.audit == nil {
+		return
+	}
+	ident, ok := FromContext(c.Request.Context())
+	if ok {
+		e.TenantID = ident.TenantID
+		e.ActorUserID = ident.UserID
+		e.ActorUsername = ident.Username
+	}
+	if err := h.audit.Record(c.Request.Context(), e); err != nil {
+		slog.Error("write audit row failed",
+			"request_id", httpx.RequestID(c.Request.Context()), "err", err)
+	}
+}
+
+// ListAudit reports the tenant's permission change trail, newest first.
+//
+// The trail names paths and users, so it is tenant-scoped like every other read
+// and gated behind perm.manage: knowing who has access to what is itself
+// privileged information.
+func (h *Handler) ListAudit(c *gin.Context) {
+	ident, ok := FromContext(c.Request.Context())
+	if !ok {
+		_ = c.Error(httpx.ErrUnauthorized)
+		return
+	}
+	if h.audit == nil {
+		_ = c.Error(httpx.ErrInternal)
+		return
+	}
+	limit, offset, err := pageParams(c)
+	if err != nil {
+		_ = c.Error(httpx.ErrInvalidRequest)
+		return
+	}
+	entries, err := h.audit.List(c.Request.Context(), ident.TenantID, limit, offset)
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	body := gin.H{"entries": entries, "limit": limit}
+	if len(entries) == limit {
+		body["next_offset"] = offset + limit
+	}
+	httpx.OK(c, body)
 }
 
 // ME answers "who am I and which tenant do I belong to" for the caller.
@@ -153,6 +211,12 @@ func (h *Handler) AssignRole(c *gin.Context) {
 		_ = c.Error(mapAdminError(err))
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionRoleGrant,
+		SubjectKind: "user",
+		SubjectID:   userID,
+		Detail:      "role_id=" + strconv.FormatInt(roleID, 10),
+	})
 	httpx.OK(c, gin.H{"user_id": userID, "role_id": roleID, "granted": true})
 }
 
@@ -178,11 +242,16 @@ func (h *Handler) RevokeRole(c *gin.Context) {
 		_ = c.Error(mapAdminError(err))
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionRoleRevoke,
+		SubjectKind: "user",
+		SubjectID:   userID,
+		// Whether a grant actually existed separates a revoke from a no-op.
+		Detail: "role_id=" + strconv.FormatInt(roleID, 10) + fmt.Sprintf(" removed=%t", removed),
+	})
 	httpx.OK(c, gin.H{"user_id": userID, "role_id": roleID, "removed": removed})
 }
 
-// ListRoles reports the roles the caller's tenant defines, so a client can pick
-// a role id without reading the database.
 // CreateRole defines a role and the permission codes it grants.
 //
 // Both halves arrive in one request because a role without permissions is not a
@@ -210,6 +279,12 @@ func (h *Handler) CreateRole(c *gin.Context) {
 		_ = c.Error(mapAdminError(err))
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionRoleCreate,
+		SubjectKind: "role",
+		SubjectID:   role.ID,
+		Detail:      strings.Join(role.Permissions, ","),
+	})
 	httpx.OK(c, role)
 }
 
@@ -242,6 +317,12 @@ func (h *Handler) UpdateRolePermissions(c *gin.Context) {
 		_ = c.Error(mapAdminError(err))
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionRolePermissions,
+		SubjectKind: "role",
+		SubjectID:   roleID,
+		Detail:      strings.Join(role.Permissions, ","),
+	})
 	httpx.OK(c, role)
 }
 
@@ -263,9 +344,16 @@ func (h *Handler) DeleteRole(c *gin.Context) {
 		_ = c.Error(mapAdminError(err))
 		return
 	}
+	h.record(c, audit.Entry{
+		Action:      audit.ActionRoleDelete,
+		SubjectKind: "role",
+		SubjectID:   roleID,
+	})
 	httpx.OK(c, gin.H{"deleted": roleID})
 }
 
+// ListRoles reports the roles the caller's tenant defines, so a client can pick a
+// role id without reading the database.
 func (h *Handler) ListRoles(c *gin.Context) {
 	ident, ok := FromContext(c.Request.Context())
 	if !ok {

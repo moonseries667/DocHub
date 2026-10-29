@@ -1,0 +1,79 @@
+# Format, vet and test on every push.
+#
+# The integration suite runs against real MySQL and Redis, not mocks, so the job
+# brings up the same versions the project targets as service containers. That is
+# also why this file exists at all: a suite nobody runs on push is a suite that
+# rots, and the two defects this project fixed late (a login that reported a dead
+# database as a wrong password, a dead-letter path that stopped working 30s after
+# boot) were both reachable only against real dependencies.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: docnub
+        ports:
+          - 3306:3306
+        # The tests create and drop docnub_test themselves; this only has to be
+        # accepting connections before the suite starts.
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prootpass"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          # No go.sum key to cache: the modules are downloaded on every run, which
+          # is seconds at this size and avoids a stale-cache class of failure.
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test
+        # -count=1 defeats the test cache, so a green run always means the suite
+        # executed against the containers rather than replaying a stored result.
+        # -p 1 because every integration test recreates the same database.
+        #
+        # GODOC_TEST_S3_* is intentionally unset: the object-store contract test
+        # skips its S3 half without an endpoint, and its local half still runs.
+        run: go test -count=1 -p 1 -timeout 400s ./...
+        env:
+          GODOC_TEST_MYSQL_DSN: root:rootpass@tcp(127.0.0.1:3306)/docnub_test?parseTime=true&charset=utf8mb4&loc=Local
+          GODOC_REDIS_ADDR: 127.0.0.1:6379
