@@ -386,6 +386,32 @@ func TestDeleteSucceedsWhenObjectIsAlreadyGone(t *testing.T) {
 	}
 }
 
+// Downloading a row whose object is gone answers 404, not 500: for the caller
+// the file is simply not there, while the server-side log records that objects
+// were removed outside the API. A 500 would make a cleaned-out bucket look
+// like a server fault.
+func TestDownloadOfMissingObjectIs404(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t, "east", "alice", seedPassword).Data.Token
+
+	uploaded := mustUpload(t, env, token, "/gone-bytes", "orphan-download.txt", []byte("bytes behind the row"))
+	row, err := env.files.Get(context.Background(), 1, uploaded.Data.ID)
+	if err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if err := env.storage.Delete(context.Background(), row.StorageKey); err != nil {
+		t.Fatalf("remove object behind the API: %v", err)
+	}
+
+	id := itoa(uploaded.Data.ID)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec := doJSON(t, env.engine, method, "/api/v1/files/"+id+"/download", token, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s of a row with missing object = %d, want 404 (body=%s)", method, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // Tenant A must never see, download or delete tenant B's file — and must not be
 // able to tell it exists.
 func TestTenantCannotReachAnotherTenantsFile(t *testing.T) {

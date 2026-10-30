@@ -2,6 +2,7 @@ package file
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"godochub/internal/httpx"
+	"godochub/internal/storage"
 	"godochub/internal/tenant"
 )
 
@@ -207,6 +209,14 @@ func parseID(c *gin.Context) (int64, bool) {
 func mapError(err error) error {
 	switch {
 	case errors.Is(err, ErrNotFound):
+		return httpx.ErrNotFound
+	// A row whose object is gone is indistinguishable from a missing file for
+	// the caller, and answering 404 instead of 500 keeps a cleaned-out bucket
+	// from looking like a server fault. The log line is the operator's signal
+	// that something deleted objects outside the API.
+	case errors.Is(err, storage.ErrNotFound):
+		slog.Error("file row points at a missing object; was the bucket cleaned outside the API?",
+			"err", err)
 		return httpx.ErrNotFound
 	case errors.Is(err, ErrNameTaken):
 		return httpx.NewError(http.StatusConflict, "a file with this name already exists in this directory")
